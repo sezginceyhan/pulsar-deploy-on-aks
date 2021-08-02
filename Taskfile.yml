@@ -1,0 +1,253 @@
+# https://taskfile.dev
+
+version: '3'
+
+output: prefixed
+
+env:
+  KUBECONFIG: '{{.PWD}}/.kube/config'
+
+dotenv: ['taskfile.env']
+
+
+tasks:
+
+  default:
+    - task: deploy:cloud-infra
+    - task: deploy:pulsar
+
+  ########################
+  ## cleanup 
+  ########################       
+
+  clean:
+      desc: cleanup of all cloud infra and local files (Run with --dry before)
+      cmds:
+      - task: tf:destroy
+  clean:local:
+      desc: cleanup local files
+      cmds:
+        - task: clean:tf:local
+        - rm -r {{.PWD}}/.kube
+
+  ########################
+  ## Terraform tasks
+  ########################
+
+  # using YAML anchors '&' and refers '*' for status checks
+  tf-plan-exists: &tf-plan-exists
+    - |
+      echo "Check if plan exists"
+      echo {{.PWD}}
+      test -f {{.PWD}}/{{.TF_DIR}}/.plan
+
+  tf:init:
+    - task: tf
+      desc: initialize terraform folder
+      vars:
+        ACTION: init
+
+  tf:plan:
+    - task: tf
+      desc: plan terraform
+      vars:
+        ACTION: plan
+        EXTRA_VARS: -out .plan -var-file {{.TF_FILE}} {{.CLI_ARGS}}
+
+  tf:apply:
+    - task: tf
+      desc: Apply terraform
+      vars:
+        ACTION: apply
+        EXTRA_VARS: .plan {{.CLI_ARGS}}
+        EXTRA_CMDS: |
+                    cp -r .kube ../
+      status: *tf-plan-exists
+
+  tf:destroy:
+    - task: tf
+      desc: |
+            Destroy terraform, User Input needed here, 
+            or run "./bin/task tf:destroy -- -auto-approve" !
+      vars:
+        ACTION: destroy
+        EXTRA_VARS: ' -var-file {{.TF_FILE}} {{.CLI_ARGS}}'
+
+  clean:tf:local:
+      desc: cleanup local terraform files
+      dir: '{{.TF_DIR}}'
+      cmds:
+        - rm -r .kube
+        - rm .plan
+
+
+  # abstract task to run terraform tasks
+  # this is just to see how taskfile handles these kind of tasks
+  # default vars like TF_FILE are also overrideable via vars: TF_FILE: ... in tasks
+  tf:
+    label: 'tf:{{.ACTION}}'
+    prefix: 'tf:{{.ACTION}}'
+    dir: '{{.TF_DIR}}'
+    desc: |
+          Runs a terraform command in given folder (defaults to {{.TF_DIR}})
+          Commands: tf:plan, tf:apply, tf:destroy
+    cmds:
+      - echo "Running terraform {{.ACTION}}"
+      - terraform {{.ACTION}} {{.EXTRA_VARS}}
+      - '{{.EXTRA_CMDS}}'
+      
+  k:init:
+    preconditions:
+      - sh: "[ -f $KUBECONFIG ]"
+        msg: "kubeconfig not found, please if env $KUBECONFIG var is set correctly"
+    cmds:
+      - kubectl get nodes
+      - echo "export variable to use kubeconfig 'export KUBECONFIG=$KUBECONFIG"
+
+
+  ########################
+  ## Deployment tasks
+  ########################      
+
+
+  deploy:pulsar:
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      cmds:
+        - export KUBECONFIG={{.KUBECONFIG}}
+        - task: helm:pulsar:deps:clone-charts-repo
+        - task: helm:pulsar:deps:set-repo-uptodate
+        - task: helm:pulsar:deps:prepare-helm
+        - task: helm:pulsar:prepare-install
+        - task: helm:pulsar:install
+      status:
+        - helm status pulsar
+
+  deploy:cloud-infra:
+    desc: deploys cloud infrastructure using terraform (aks, vnet etc.)
+    dir: '{{.PWD}}/infra'
+    vars:
+      TF_FILE: infra.tfvars.json
+    cmds:
+      - task: tf:plan
+      - task: tf:apply
+
+  ########################
+  ## Go app tasks
+  ########################
+  go:prepare:
+      desc: Get needed libraries
+      dir: '{{.PWD}}/apps/go_client'
+      cmds:
+        - go mod tidy -v
+  go:build:
+      desc: Build golang application
+      dir: '{{.PWD}}/apps/go_client'
+      cmds:
+        - go build -v -o puslar_client_go_app *.go
+
+  ########################
+  ## Pulsar helm tasks
+  ########################
+
+
+  helm:pulsar:deps:clone-charts-repo:
+      desc: Clones pulsar helm charts git repo
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      cmds:
+        - git clone https://github.com/apache/pulsar-helm-chart
+      status:
+        - test -d pulsar-helm-chart
+
+  helm:pulsar:deps:set-repo-uptodate:
+      desc: updates pulsar helm git repo to latest default branch
+      deps: [helm:pulsar:deps:clone-charts-repo]
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}/pulsar-helm-chart'
+      cmds:
+        - git remote update
+        - git checkout -
+      status:
+        - "[[ $(git rev-list HEAD...$(git symbolic-ref refs/remotes/origin/HEAD) --count) == 0 ]]"
+
+  helm:pulsar:deps:prepare-helm:
+      desc: adds pulsar helm repo & updates helm repo
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      cmds:
+        - helm repo add apache https://pulsar.apache.org/charts
+        - helm repo add streamnative https://charts.streamnative.io
+        - helm repo update   
+
+  # currently throws error in k8s >= 1.16 as some k apis are not served anymore but used in chart
+  helm:pulsar:deps:prepare-storage-provisioner:
+      desc: adds pulsar helm repo & updates helm repo
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      deps: [helm:pulsar:deps:clone-charts-repo]
+      cmds:
+        - |
+          helm install {{ .PULSAR_HELM_STORAGE_PROVISIONER}} \
+            streamnative/local-storage-provisioner \
+            --set namespace=local-storage
+
+  helm:pulsar:prepare-install:
+      desc: prepare pulsar helm release
+      deps: [helm:pulsar:deps:clone-charts-repo]
+      summary: |
+              Pulsar deployment requires some steps to run before
+              deployment on k8s with Helm like installing the cert-manager
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}/pulsar-helm-chart/scripts'
+      cmds:
+        - bash ./cert-manager/install-cert-manager.sh
+        - | 
+          bash ./pulsar/prepare_helm_release.sh \
+            --namespace {{ .PULSAR_KUBERNETES_NAMESPACE}} \
+            --release {{.PULSAR_HELM_RELEASE}} \
+            --create-namespace \
+            {{.CLI_ARGS}}
+
+  helm:pulsar:upgrade:
+      desc: Upgrade pulsar with helm
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      cmds:
+        - helm get values -n {{ .PULSAR_KUBERNETES_NAMESPACE}} {{.PULSAR_HELM_RELEASE}} > helm-pulsar.yml
+        - helm upgrade -n {{ .PULSAR_KUBERNETES_NAMESPACE}} {{.PULSAR_HELM_RELEASE}} apache/pulsar -f helm-pulsar.yml
+
+  clean:helm:pulsar-tls:  
+      desc: cleans pulsar helm release
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}/pulsar-helm-chart/scripts'
+      cmds:
+        - |
+          bash ./pulsar/clean_tls.sh \
+            --namespace {{.PULSAR_KUBERNETES_NAMESPACE}} \
+            --release {{.PULSAR_HELM_RELEASE}} \
+            {{.CLI_ARGS}}
+
+  clean:helm:pulsar:
+      desc: cleans pulsar helm release
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}/pulsar-helm-chart/scripts'
+      cmds:
+        - |
+          bash ./pulsar/cleanup_helm_release.sh \
+            --namespace {{.PULSAR_KUBERNETES_NAMESPACE}} \
+            --release {{.PULSAR_HELM_RELEASE}} \
+            --delete-namespace \
+            {{.CLI_ARGS}}
+
+  clean:pulsar:namespace-all:
+    desc: cleans pulsar namespace (hard clean)
+    cmds:
+      - kubectl delete all --all --namespace {{.PULSAR_KUBERNETES_NAMESPACE}}
+    status:
+      - "[ $(kubectl get namespaces {{.PULSAR_KUBERNETES_NAMESPACE}}) -eq 0 ]"
+
+  helm:pulsar:install:
+      dir: '{{.PWD}}/{{.PULSAR_DIR}}'
+      cmds:
+        - |
+          helm install \
+              --timeout 10m \
+              --set initialize=true \
+              --set namespace={{.PULSAR_KUBERNETES_NAMESPACE}} \
+              --set volumes.persistence=false \
+              --namespace {{.PULSAR_KUBERNETES_NAMESPACE}} \
+              {{.PULSAR_HELM_RELEASE}} \
+              apache/pulsar
+              # --set namespaceCreate=true \

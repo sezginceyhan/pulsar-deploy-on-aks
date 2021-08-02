@@ -1,0 +1,3 @@
+pulsar:
+  url: <pulsar ip>
+  port: 6650
